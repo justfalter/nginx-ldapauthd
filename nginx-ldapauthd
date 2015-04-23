@@ -1,0 +1,358 @@
+#!/usr/bin/env python
+# -*- coding=utf8 -*-
+"""
+nginx-ldapauthd
+===============
+
+A backend for the nginx auth_request module.
+
+* Listens on unix socket (SOCK_NAME) and authenticates users against LDAP
+* Two modes:
+    * Valid user: bind against LDAP must be successful. You should probably
+      use the other mode, because this will also work for machine accounts.
+      URL: ROUTE_PREFIX + "/auth"
+    * Member of a group: successful bind, objectclass=person, and user
+      must be member of some group. This is checked through MEMBER_ATTR
+      and PRIMARY_ATTR (for Active Directory).
+      URL: ROUTE_PREFIX + "/auth/<group name>"
+* Concurrency through gevent and forking (see PROCESSES)
+* Users and groups are cached for a few seconds, because the LDAP
+  latency is rather high. See USER_CACHE_LIFETIME and GROUP_CACHE_LIFETIME.
+
+Written by: Andreas Fleig <andreasfleig@gmail.com>
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+"""
+from gevent import monkey
+monkey.patch_all()
+from gevent import socket
+from gevent.wsgi import WSGIServer
+from werkzeug.wrappers import Request, Response
+from werkzeug.routing import Map, Rule
+from werkzeug.exceptions import HTTPException
+from pwd import getpwnam
+from base64 import b64decode
+import gevent
+import ldap
+import sys
+import logging
+import os
+import time
+import hashlib
+
+# LDAP options
+LDAP_URI = "ldaps://localhost"
+USER_DN_TMPL = "CN=%s,CN=Users,DC=fim,DC=uni-mannheim,DC=de"
+GROUP_DN_TMPL = "CN=%s,CN=Users,DC=fim,DC=uni-mannheim,DC=de"
+GROUP_BASE_DN = "CN=Users,DC=fim,DC=uni-mannheim,DC=de"
+MEMBER_ATTR = "memberOf"
+PRIMARY_ATTR = "primaryGroupID"
+GID_ATTR = "gidNumber"
+
+# HTTP options
+REALM = "FIM"
+ROUTE_PREFIX = "/ldap"
+
+# process options
+SETUID = "www-data"
+SOCK_NAME = "/var/run/%s.sock" % os.path.basename(__file__)
+TIMEOUT = 10
+PROCESSES = 2
+LOG_LEVEL = logging.INFO
+
+# users -> (credentials, groups) and gids -> (group) are cached, because
+# the LDAP latency is several milliseconds per request
+USER_CACHE_LIFETIME = 15
+GROUP_CACHE_LIFETIME = 60
+
+user_cache = dict()
+group_cache = dict()
+
+# ignore cert problems
+ldap.set_option(ldap.OPT_X_TLS_REQUIRE_CERT, ldap.OPT_X_TLS_NEVER)
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=LOG_LEVEL,
+                    format='%(asctime)s %(process)s %(levelname)s: ' +
+                           '%(message)s')
+
+# HTTP responses
+NOT_AUTHORIZED = Response("Not Authorized",
+                          status=401,
+                          headers={
+                              'WWW-Authenticate': 'Basic realm="%s"' % REALM
+                          })
+OK = Response("OK", status=200)
+
+
+# global persistent ldap connection
+ldap_con = None
+
+
+def wsgi_app(environ, start_response):
+    """
+    The main WSGI application. Invokes the router and returns responses.
+    """
+    timeout = gevent.Timeout(TIMEOUT)
+    timeout.start()
+    request = Request(environ)
+    response = dispatch(request)
+    timeout.cancel()
+    return response(environ, start_response)
+
+
+def dispatch(request):
+    """
+    Router. See below for ROUTES.
+    """
+    adapter = ROUTES.bind_to_environ(request.environ)
+    try:
+        endpoint, values = adapter.match()
+        return endpoint(request, **values)
+    except HTTPException, e:
+        return e
+
+
+def endpoint_valid_user(request):
+    """
+    WSGI endpoint that checks for a valid user.
+    """
+    user, password, err = auth_info(request)
+    if err:
+        return NOT_AUTHORIZED
+    user_dn = USER_DN_TMPL % user
+    success = authenticate(user_dn, password)
+    if success:
+        return OK
+    return NOT_AUTHORIZED
+
+
+def endpoint_in_group(request, group_name):
+    """
+    WSGI endpoint that checks for a valid user, which has objectclass=person,
+    and is member of group_name.
+    """
+    user, password, err = auth_info(request)
+    if err:
+        return NOT_AUTHORIZED
+    user_dn = USER_DN_TMPL % user
+    success = authenticate(user_dn, password)
+    if success:
+        groups = get_groups(user_dn, password)
+        required_group = GROUP_DN_TMPL % group_name
+        if required_group in groups:
+            return OK
+        logger.debug("user %s is not in required group %s" % (user_dn,
+                                                              required_group))
+    return NOT_AUTHORIZED
+
+
+def authenticate(user_dn, password):
+    """
+    Authenticates a user against LDAP. The user DN is created from the
+    username and the format string USER_DN_TMPL. Returns True on success
+    and False otherwise.
+    """
+    global ldap_con
+    hashed = hashlib.new("sha256")
+    hashed.update(user_dn + password)
+    if user_dn in user_cache and user_cache[user_dn][0] == hashed.digest():
+        return True
+    if len(user_dn) == 0:
+        logger.error("Attempted to authenticate empty user DN")
+        return False
+
+    ldap_con, err = bind(user_dn, password)
+    if err is None:
+        user_cache[user_dn] = [hashed.digest(), None]
+        gevent.spawn(delete_later, user_cache, user_dn, USER_CACHE_LIFETIME)
+        return True
+    return False
+
+
+def bind(user_dn, password, recursion=False):
+    """
+    Tries to bind to the LDAP directory with the given credentials. Returns
+    the tuple (ldap_con, err). ldap_con is None if the bind was not
+    successful. err is None if successful, and True otherwise.
+    If any error occurs, the global LDAP connection is invalidated.
+    """
+    global ldap_con
+    if len(user_dn) == 0:
+        logger.error("Attempted to authenticate empty user DN")
+        return (None, True)
+    try:
+        if ldap_con is None:
+            ldap_con = ldap.initialize(LDAP_URI)
+        res = ldap_con.simple_bind_s(user_dn, password)
+        if res[0] == 97:
+            logger.debug("successful bind as %s" % user_dn)
+            return (ldap_con, None)
+        logger.debug("could not bind as %s" % user_dn)
+        ldap_con = None
+        return (None, True)
+    except ldap.SERVER_DOWN:
+        # either timeout on persistent connection, or server is really down
+        if not recursion:
+            return bind(user_dn, password, recursion=True)
+        else:
+            logger.error("LDAP server may be down!")
+            return (None, True)
+    except ldap.INVALID_CREDENTIALS:
+        logger.debug("invalid credentials for %s" % user_dn)
+        ldap_con = None
+        return (None, True)
+    except Exception, e:
+        logger.exception(e)
+        ldap_con = None
+        return (None, True)
+
+
+def delete_later(dictionary, key, delay):
+    """
+    Deletes key from dictionary after delay seconds. Use with gevent.spawn.
+    """
+    time.sleep(delay)
+    if key in dictionary:
+        logger.debug("deleting from cache: %s" % key)
+        del dictionary[key]
+
+
+def get_groups(user_dn, password):
+    """
+    Returns the list of groups of which user_dn is a member. The password is
+    required in case that bind() must be called for the global LDAP
+    connection.
+    """
+    global ldap_con
+    if user_dn in user_cache and user_cache[user_dn][1] is not None:
+        return user_cache[user_dn][1]
+    if ldap_con is None:
+        ldap_con, err = bind(user_dn, password)
+        if err is not None:
+            return []
+    user_res = ldap_con.search_s(user_dn, ldap.SCOPE_SUBTREE,
+                                 "(objectclass=person)",
+                                 [MEMBER_ATTR, PRIMARY_ATTR])
+    groups = []
+    # we should never get more than one user, because we searched for the exact DN.
+    if len(user_res) != 1:
+        return []
+    attrs = user_res[0][1]
+    if MEMBER_ATTR in attrs:
+        for group in attrs[MEMBER_ATTR]:
+            groups.append(group)
+    # Active Directory does not list the primary group with through
+    # MEMBER_ATTR, but via PRIMARY_ATTR instead.
+    if PRIMARY_ATTR in attrs:
+        gid = attrs[PRIMARY_ATTR][0]
+        primary_group = get_group_with_gid(ldap_con, gid)
+        if primary_group is not None:
+            groups.append(primary_group)
+    if user_dn not in user_cache:
+        user_cache[user_dn] = [None, None]
+    logger.debug("fetched groups for %s" % user_dn)
+    user_cache[user_dn][1] = groups
+    gevent.spawn(delete_later, user_cache, user_dn, USER_CACHE_LIFETIME)
+    return groups
+
+
+def get_group_with_gid(con, gid):
+    """
+    Searches the LDAP directory for a group with the given gid, using the
+    LDAP connection con. Returns the DN of the group, if successful.
+    """
+    group_res = con.search_s(GROUP_BASE_DN,
+                             ldap.SCOPE_SUBTREE,
+                             "(&(objectclass=group)(%s=%s))" % (GID_ATTR, gid),
+                             [GID_ATTR])
+    if len(group_res) != 1:
+        logger.error("Failed to find group with gid %s" % gid)
+    else:
+        return group_res[0][0]
+
+
+def auth_info(request):
+    """
+    Check if request contains "Authorization" header and returns a
+    tuple of: (username, password, err). If there is no "Authorization"
+    header, or if it's corrupt, err == True.
+    """
+    auth = None
+    if "Authorization" in request.headers:
+        auth = request.headers["Authorization"]
+    elif "authorization" in request.headers:
+        auth = request.headers["authorization"]
+    else:
+        return (None, None, True)
+
+    auth = auth.split()
+    if len(auth) == 2 and auth[0] == "Basic":
+        try:
+            user_pass = b64decode(auth[1]).split(":", 1)
+            return (user_pass[0], user_pass[1], None)
+        except TypeError:
+            pass
+    logger.debug("invalid auth info in request")
+    return (None, None, True)
+
+
+ROUTES = Map([
+    Rule('%s/auth' % ROUTE_PREFIX, endpoint=endpoint_valid_user),
+    Rule('%s/auth/<group_name>' % ROUTE_PREFIX, endpoint=endpoint_in_group),
+])
+
+
+def fork():
+    for i in range(1, PROCESSES):
+        pid = os.fork()
+        if pid != 0:
+            logger.info("Forked child process with pid %s" % pid)
+        else:
+            break
+
+
+def main():
+    try:
+        if os.path.exists(SOCK_NAME):
+            try:
+                os.remove(SOCK_NAME)
+            except Exception, e:
+                logger.exception(e)
+                logger.error(("Failed to remove existing socket " +
+                              "at %s. Exiting...") % SOCK_NAME)
+                sys.exit(1)
+
+        pwnam = getpwnam(SETUID)
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(SOCK_NAME)
+        os.chown(SOCK_NAME, pwnam.pw_uid, pwnam.pw_gid)
+        if os.getuid() == 0:
+            os.setgid(pwnam.pw_gid)
+            os.setuid(pwnam.pw_uid)
+            logger.info(("Dropped root privileges, uid and gid set " +
+                         "to: %s" % SETUID))
+
+        sock.listen(100)
+        fork()
+        logger.info("Starting WSGIServer on %s..." % SOCK_NAME)
+        WSGIServer(sock, wsgi_app, log=open("/dev/null", "w")).serve_forever()
+    except Exception, e:
+        logger.exception(e)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
